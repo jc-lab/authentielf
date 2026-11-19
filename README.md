@@ -12,11 +12,69 @@ signatures and RFC 3161 timestamps. Only two things differ:
   has the same digest before and after signing, so `authentielf digest app`
   equals `sha256sum app` of the unsigned binary.
 
+## Install
+
+Download a prebuilt static binary from
+[Releases](https://github.com/jc-lab/authentielf/releases). Builds are
+available for these platforms:
+
+| OS | Architectures |
+|---|---|
+| Linux | `amd64`, `386`, `arm64`, `armv7`, `armv6`, `riscv64`, `ppc64`, `ppc64le`, `s390x`, `loong64`, `mips-softfloat`, `mipsle-softfloat`, `mips64`, `mips64le` |
+| macOS | `amd64`, `arm64` |
+| Windows | `amd64`, `arm64` |
+
+The CLI can sign ELF files on any of these platforms. To install a release
+on Linux:
+
+```sh
+V=v1.0.0 A=linux_amd64
+curl -LO https://github.com/jc-lab/authentielf/releases/download/$V/authentielf_${V}_${A}.tar.gz
+curl -LO https://github.com/jc-lab/authentielf/releases/download/$V/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf authentielf_${V}_${A}.tar.gz && sudo install authentielf_${V}_${A}/authentielf /usr/local/bin/
+```
+
+Or build from source with `go install github.com/jc-lab/authentielf/cmd/authentielf@latest`.
+
+### Verifying a release
+
+Every archive has a [SLSA build provenance](https://slsa.dev/provenance)
+attestation. It is signed through Sigstore and records the repository,
+the tag, the commit and the workflow run that built the archive. Check it
+with the GitHub CLI:
+
+```sh
+gh attestation verify authentielf_${V}_${A}.tar.gz --repo jc-lab/authentielf \
+  --signer-workflow jc-lab/authentielf/.github/workflows/release.yml
+```
+
+This proves that the archive was built by this repository's release
+workflow. The `SHA256SUMS` check alone only proves that the file matches
+the published list.
+
+### Releasing
+
+Push a tag of the form `vMAJOR.MINOR.PATCH`. A tag with a suffix, such as
+`v1.2.0-rc.1`, publishes a pre-release. On a tag push,
+[`release.yml`](.github/workflows/release.yml) does the following:
+
+1. Runs the full CI matrix.
+2. Builds the archives with `make dist VERSION=<tag>`
+   ([`scripts/dist.sh`](scripts/dist.sh)).
+3. Runs the native e2e suite against the shipped `linux_amd64` binary.
+4. Creates build provenance attestations for every archive in `SHA256SUMS`
+   (`actions/attest`) and verifies one with `gh attestation verify`.
+5. Publishes a GitHub release with the archives, `SHA256SUMS` and generated
+   notes.
+
+The builds are reproducible: `-trimpath`, and archive metadata pinned to the
+commit time. Running `make dist VERSION=<tag>` on the tagged commit gives
+identical checksums.
+
 ## CLI
 
 ```sh
-go install github.com/jc-lab/authentielf/cmd/authentielf@latest
-
 authentielf sign -cert signer.pem -key signer.key [-hash sha256] [-t http://timestamp.digicert.com] app
 authentielf sign -append -hash sha512 -cert other.pem -key other.key app   # add a second signature
 authentielf verify [-ca root.pem] [-tsa-ca tsa-root.pem] app              # exit 0 = all signatures valid

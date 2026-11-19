@@ -5,8 +5,10 @@
 #   make e2e E2E_TARGETS=all STRICT=1          every target; missing tools fail
 #   make deps E2E_TARGETS=all                  install toolchains + qemu (Ubuntu 24.04, sudo)
 #   make fuzz FUZZTIME=60s
+#   make dist VERSION=v1.2.3                   release archives in build/dist (scripts/dist.sh)
 
 GO          ?= go
+VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BUILD_DIR   ?= build
 CLI         := $(BUILD_DIR)/authentielf
 FUZZTIME    ?= 30s
@@ -31,12 +33,15 @@ PKGS_ppc64   := gcc-powerpc64-linux-gnu libc6-dev-ppc64-cross qemu-user
 PKGS_mips    := gcc-mips-linux-gnu libc6-dev-mips-cross qemu-user
 DEPS := $(sort $(PKGS_common) $(foreach t,$(E2E_TARGETS),$(PKGS_$(t))))
 
-.PHONY: all build test lint unit e2e fuzz deps clean
+.PHONY: all build test lint unit e2e fuzz dist deps clean
 
 all: build
 
 build:
-	$(GO) build -o $(CLI) ./cmd/authentielf
+	$(GO) build -ldflags "-X main.version=$(VERSION)" -o $(CLI) ./cmd/authentielf
+
+dist:
+	GO=$(GO) scripts/dist.sh $(VERSION) $(abspath $(BUILD_DIR))/dist
 
 lint:
 	@out=$$(find . -path ./$(BUILD_DIR) -prune -o -name '*.go' -print | xargs gofmt -l); \

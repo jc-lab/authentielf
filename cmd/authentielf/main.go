@@ -13,6 +13,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -29,9 +31,24 @@ Commands:
   remove     remove one or all signatures (-all restores the original file)
   extract    write the PKCS#7 signature blob to a file
   digest     print the image digest (= hash of the original, unsigned file)
+  version    print the CLI version
 
 Run "authentielf <command> -h" for command flags.
 `
+
+// version is set at release build time with -ldflags "-X main.version=...".
+var version = ""
+
+func versionString() string {
+	v := version
+	if v == "" {
+		v = "dev"
+		if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+			v = bi.Main.Version // go install ...@vX.Y.Z
+		}
+	}
+	return fmt.Sprintf("authentielf %s (%s, %s/%s)", v, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -49,8 +66,12 @@ func main() {
 		"digest":    cmdDigest,
 	}
 	name := os.Args[1]
-	if name == "-h" || name == "--help" || name == "help" {
+	switch name {
+	case "-h", "--help", "help":
 		fmt.Print(usage)
+		return
+	case "version", "-version", "--version":
+		fmt.Println(versionString())
 		return
 	}
 	fn, ok := cmds[name]

@@ -1,0 +1,95 @@
+name: Release
+
+# Push a tag like v1.2.3 (or v1.2.3-rc.1 for a pre-release) to publish the
+# CLI for every OS/arch in scripts/dist.sh as a GitHub release.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write          # create the release and upload assets
+      id-token: write          # OIDC token for the Sigstore signing certificate
+      attestations: write      # store the build provenance attestations
+      artifact-metadata: write # artifact storage records (required by actions/attest)
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.mod
+
+      - name: Check tag
+        run: |
+          if [[ ! $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag '$TAG' is not of the form vMAJOR.MINOR.PATCH[-PRERELEASE]"
+            exit 1
+          fi
+
+      - name: Build archives
+        run: make dist VERSION="$TAG"
+
+      # Exercise the exact binary being shipped, not a fresh build.
+      - name: Smoke test release binary
+        run: |
+          dir=$(mktemp -d)
+          tar -C "$dir" -xzf "build/dist/authentielf_${TAG}_linux_amd64.tar.gz"
+          bin="$dir/authentielf_${TAG}_linux_amd64/authentielf"
+          "$bin" version | tee /dev/stderr | grep -qF "authentielf $TAG "
+          AUTHENTIELF="$bin" OUT="$PWD/build/e2e-release" STRICT=1 test/e2e.sh native
+
+      # SLSA build provenance for every archive listed in SHA256SUMS, signed
+      # with a Sigstore (public-good instance) certificate bound to this
+      # workflow run. Users verify with:
+      #   gh attestation verify <archive> --repo jc-lab/authentielf
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-checksums: build/dist/SHA256SUMS
+
+      - name: Verify attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Retry briefly: a fresh attestation may take a moment to be served.
+          for i in 1 2 3 4 5; do
+            gh attestation verify "build/dist/authentielf_${TAG}_linux_amd64.tar.gz" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: build/dist/
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd build/dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-run of the workflow: replace the assets, keep the notes.
+            gh release upload "$TAG" ./* --clobber
+          else
+            flags=(--verify-tag --title "$TAG" --generate-notes)
+            [[ $TAG == *-* ]] && flags+=(--prerelease)
+            gh release create "$TAG" "${flags[@]}" ./*
+          fi
