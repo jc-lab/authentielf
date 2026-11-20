@@ -57,14 +57,11 @@ This proves that the file was built by this repository's release
 workflow. The `SHA256SUMS` check alone only proves that the file matches
 the published list.
 
-The binaries are also code-signed with an EV code-signing certificate whose
-key is held in a Cloud HSM, and timestamped by DigiCert:
+The binaries are also code-signed:
 
 - Linux binaries carry an AuthentiELF signature:
   `authentielf verify authentielf` (system roots).
-- Windows binaries carry an Authenticode signature, applied with
-  [jsign](https://ebourg.github.io/jsign/)
-  ([`scripts/sign-pe.sh`](scripts/sign-pe.sh)). Check it in the file's
+- Windows binaries carry an Authenticode signature: Check it in the file's
   Properties → Digital Signatures, with
   `Get-AuthenticodeSignature authentielf.exe`, or with
   `osslsigncode verify -in authentielf.exe`.
