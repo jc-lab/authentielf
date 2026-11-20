@@ -8,6 +8,23 @@
 # <outdir>/SHA256SUMS. Builds are static (CGO_ENABLED=0) and reproducible:
 # -trimpath, no VCS stamping, and archive metadata pinned to the commit
 # time (SOURCE_DATE_EPOCH).
+#
+# Optional signing, enabled by SIGN_KEY_FILE or SIGN_KEY:
+#   Linux (ELF)  AuthentiELF, with the CLI built from this tree
+#   Windows (PE) Authenticode, with jsign via scripts/sign-pe.sh ($JSIGN)
+#   macOS        not signed
+# Both read the key and certificates from the environment:
+#   SIGN_KEY_FILE   private key PEM file, or gcp-kms://<Cloud KMS key resource>
+#                   (token in $GOOGLE_OAUTH_ACCESS_TOKEN)
+#   SIGN_KEY        private key PEM text
+#   SIGN_CERT_FILE  signer certificate followed by intermediates (PEM file)
+#   SIGN_CERT       the same as PEM text
+#   SIGN_CHAIN_FILE / SIGN_CHAIN  extra intermediates (optional)
+#   SIGN_TSA        RFC 3161 timestamp server URL (optional)
+# Signed archives are not bit-for-bit reproducible (signing and timestamp
+# times). For Linux, "authentielf remove -all" on a shipped binary yields
+# exactly the reproducible unsigned build, and "authentielf digest" is its
+# SHA-256; the macOS archives stay reproducible.
 set -euo pipefail
 
 VERSION=${1:?usage: dist.sh <version> [outdir]}
@@ -38,6 +55,32 @@ mkdir -p "$OUT"
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 
+sign=${SIGN_KEY_FILE:-${SIGN_KEY:-}}
+if [ -n "$sign" ]; then
+	if [ -z "${SIGN_CERT_FILE:-}${SIGN_CERT:-}" ]; then
+		echo "dist.sh: SIGN_CERT_FILE or SIGN_CERT is required for signing" >&2
+		exit 1
+	fi
+	read -ra jsign <<<"${JSIGN:-jsign}"
+	command -v "${jsign[0]}" >/dev/null ||
+		{ echo "dist.sh: ${jsign[0]} (\$JSIGN) is required to sign Windows binaries" >&2; exit 1; }
+	signer=$stage/.authentielf-host
+	env -u GOOS -u GOARCH -u GOARM -u GOMIPS CGO_ENABLED=0 "$GO" build -trimpath -o "$signer" ./cmd/authentielf
+	elf_args=(sign -n authentielf)
+	if [ -n "${SIGN_TSA:-}" ]; then elf_args+=(-t "$SIGN_TSA"); fi
+fi
+
+# retry runs a signing command, retrying transient KMS/TSA failures. Both
+# signers replace the previous attempt's signature, so a retry is idempotent.
+retry() {
+	for i in 1 2 3; do
+		"$@" >&2 && return 0
+		echo "dist.sh: '$*' failed (attempt $i)" >&2
+		sleep $((i * 5))
+	done
+	return 1
+}
+
 for t in "${TARGETS[@]}"; do
 	IFS=/ read -r os arch variant <<<"$t"
 	name=$arch
@@ -55,6 +98,12 @@ for t in "${TARGETS[@]}"; do
 	env "${env[@]}" "$GO" build -trimpath -buildvcs=false \
 		-ldflags "-s -w -buildid= -X main.version=$VERSION" \
 		-o "$dir/$exe" ./cmd/authentielf
+	if [ -n "$sign" ]; then
+		case $os in
+		linux) retry "$signer" "${elf_args[@]}" "$dir/$exe" ;;
+		windows) SIGN_NAME=authentielf retry "$ROOT/scripts/sign-pe.sh" "$dir/$exe" ;;
+		esac
+	fi
 	cp LICENSE README.md "$dir/"
 	touch -d "@$SOURCE_DATE_EPOCH" "$dir" "$dir"/*
 	if [ "$os" = windows ]; then

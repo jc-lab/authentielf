@@ -176,10 +176,14 @@ func outputPath(out, in string) string {
 
 func cmdSign(args []string) error {
 	fs := newFlagSet("sign", "<file>")
-	certFile := fs.String("cert", "", "PEM certificate file: signer certificate, optionally followed by intermediates (required)")
-	keyFile := fs.String("key", "", "PEM private key file (PKCS#8, PKCS#1 or SEC1) (required)")
-	chainFile := fs.String("chain", "", "additional PEM file with intermediate certificates")
-	hashName := fs.String("hash", "sha256", "digest algorithm: sha256, sha384, sha512, sha1")
+	certFile := fs.String("cert-file", "", "PEM certificate file: signer certificate, optionally followed by intermediates\n"+
+		"(default: $"+envCertFile+", or PEM text in $"+envCert+")")
+	keyFile := fs.String("key-file", "", "PEM private key file (PKCS#8, PKCS#1 or SEC1), or gcp-kms://<Cloud KMS crypto key [version] resource name>\n"+
+		"(access token from $"+kmsTokenEnv+"; a crypto key selects the enabled version matching the certificate)\n"+
+		"(default: $"+envKeyFile+", or PEM text in $"+envKey+")")
+	chainFile := fs.String("chain-file", "", "additional PEM file with intermediate certificates\n"+
+		"(default: $"+envChainFile+", or PEM text in $"+envChain+"; optional)")
+	hashName := fs.String("hash", "sha256", "digest algorithm: sha256, sha384, sha512, sha1 (gcp-kms: default is the key's digest)")
 	appendSig := fs.Bool("append", false, "add as an additional (nested) signature instead of replacing existing ones")
 	tsURL := fs.String("t", "", "RFC 3161 timestamp server URL")
 	name := fs.String("n", "", "program name (SpcSpOpusInfo)")
@@ -189,28 +193,50 @@ func cmdSign(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *certFile == "" || *keyFile == "" {
-		fs.Usage()
-		return exitError(2)
+	keySrc, err := resolveSource("key-file", *keyFile, envKeyFile, envKey)
+	if err != nil {
+		return err
+	}
+	certSrc, err := resolveSource("cert-file", *certFile, envCertFile, envCert)
+	if err != nil {
+		return err
 	}
 	h, err := parseHash(*hashName)
 	if err != nil {
 		return err
 	}
-	key, err := loadKey(*keyFile)
+	certs, err := loadCertSource(certSrc)
 	if err != nil {
 		return err
 	}
-	certs, err := loadCerts(*certFile)
+	chainSrc, err := lookupSource(*chainFile, envChainFile, envChain)
 	if err != nil {
 		return err
 	}
-	if *chainFile != "" {
-		more, err := loadCerts(*chainFile)
+	if chainSrc.name != "" {
+		more, err := loadCertSource(chainSrc)
 		if err != nil {
 			return err
 		}
 		certs = append(certs, more...)
+	}
+	var key crypto.Signer
+	if res, ok := strings.CutPrefix(keySrc.file, kmsScheme); ok {
+		kms, err := openKMS(res, certs[0].PublicKey)
+		if err != nil {
+			return err
+		}
+		hashSet := false
+		fs.Visit(func(f *flag.Flag) { hashSet = hashSet || f.Name == "hash" })
+		if !hashSet {
+			h = kms.Hash()
+		} else if h != kms.Hash() {
+			return fmt.Errorf("-hash %s: %s requires %v", *hashName, kms.Algorithm(), kms.Hash())
+		}
+		fmt.Fprintf(os.Stderr, "Using Cloud KMS key %s (%s)\n", kms.Name(), kms.Algorithm())
+		key = kms
+	} else if key, err = loadKey(keySrc); err != nil {
+		return err
 	}
 	var leaf *x509.Certificate
 	var inter []*x509.Certificate

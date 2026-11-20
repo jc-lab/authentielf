@@ -199,9 +199,9 @@ check() {
 	for f in "${files[@]}"; do
 		local o=$dir/$f t=$s/$f
 		cp "$o" "$t"
-		"$AELF" sign -cert "$pki/signer1-chain.pem" -key "$pki/signer1.key" -t "$TSA_URL" -n "$sample" "$t" >/dev/null ||
+		"$AELF" sign -cert-file "$pki/signer1-chain.pem" -key-file "$pki/signer1.key" -t "$TSA_URL" -n "$sample" "$t" >/dev/null ||
 			{ why="sign failed for $f"; break; }
-		"$AELF" sign -append -hash sha384 -cert "$pki/signer2.pem" -key "$pki/signer2.key" "$t" >/dev/null ||
+		"$AELF" sign -append -hash sha384 -cert-file "$pki/signer2.pem" -key-file "$pki/signer2.key" "$t" >/dev/null ||
 			{ why="append failed for $f"; break; }
 		"$AELF" verify -q -ca "$pki/root.pem" "$t" || { why="verify failed for $f"; break; }
 		[ "$("$AELF" digest "$t" | cut -d' ' -f1)" = "$(sha256sum "$o" | cut -d' ' -f1)" ] ||

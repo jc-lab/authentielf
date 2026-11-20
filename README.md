@@ -28,9 +28,12 @@ The CLI can sign ELF files on any of these platforms. To install a release
 on Linux:
 
 ```sh
-V=v1.0.0 A=linux_amd64
-curl -LO https://github.com/jc-lab/authentielf/releases/download/$V/authentielf_${V}_${A}.tar.gz
-curl -LO https://github.com/jc-lab/authentielf/releases/download/$V/SHA256SUMS
+A=linux_amd64
+# Latest release tag (e.g. v1.2.3), from the /releases/latest redirect; or set V yourself.
+V=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/jc-lab/authentielf/releases/latest)
+V=${V##*/}
+curl -fLO https://github.com/jc-lab/authentielf/releases/download/$V/authentielf_${V}_${A}.tar.gz
+curl -fLO https://github.com/jc-lab/authentielf/releases/download/$V/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
 tar -xzf authentielf_${V}_${A}.tar.gz && sudo install authentielf_${V}_${A}/authentielf /usr/local/bin/
 ```
@@ -39,44 +42,39 @@ Or build from source with `go install github.com/jc-lab/authentielf/cmd/authenti
 
 ### Verifying a release
 
-Every archive has a [SLSA build provenance](https://slsa.dev/provenance)
-attestation. It is signed through Sigstore and records the repository,
-the tag, the commit and the workflow run that built the archive. Check it
-with the GitHub CLI:
+Every archive, and every binary inside one, has a
+[SLSA build provenance](https://slsa.dev/provenance) attestation. It is
+signed through Sigstore and records the repository, the tag, the commit
+and the workflow run that built the file. Check either with the GitHub CLI:
 
 ```sh
 gh attestation verify authentielf_${V}_${A}.tar.gz --repo jc-lab/authentielf \
   --signer-workflow jc-lab/authentielf/.github/workflows/release.yml
+gh attestation verify ./authentielf --repo jc-lab/authentielf   # an extracted binary
 ```
 
-This proves that the archive was built by this repository's release
+This proves that the file was built by this repository's release
 workflow. The `SHA256SUMS` check alone only proves that the file matches
 the published list.
 
-### Releasing
+The binaries are also code-signed with an EV code-signing certificate whose
+key is held in a Cloud HSM, and timestamped by DigiCert:
 
-Push a tag of the form `vMAJOR.MINOR.PATCH`. A tag with a suffix, such as
-`v1.2.0-rc.1`, publishes a pre-release. On a tag push,
-[`release.yml`](.github/workflows/release.yml) does the following:
-
-1. Runs the full CI matrix.
-2. Builds the archives with `make dist VERSION=<tag>`
-   ([`scripts/dist.sh`](scripts/dist.sh)).
-3. Runs the native e2e suite against the shipped `linux_amd64` binary.
-4. Creates build provenance attestations for every archive in `SHA256SUMS`
-   (`actions/attest`) and verifies one with `gh attestation verify`.
-5. Publishes a GitHub release with the archives, `SHA256SUMS` and generated
-   notes.
-
-The builds are reproducible: `-trimpath`, and archive metadata pinned to the
-commit time. Running `make dist VERSION=<tag>` on the tagged commit gives
-identical checksums.
+- Linux binaries carry an AuthentiELF signature:
+  `authentielf verify authentielf` (system roots).
+- Windows binaries carry an Authenticode signature, applied with
+  [jsign](https://ebourg.github.io/jsign/)
+  ([`scripts/sign-pe.sh`](scripts/sign-pe.sh)). Check it in the file's
+  Properties → Digital Signatures, with
+  `Get-AuthenticodeSignature authentielf.exe`, or with
+  `osslsigncode verify -in authentielf.exe`.
+- macOS binaries are not signed.
 
 ## CLI
 
 ```sh
-authentielf sign -cert signer.pem -key signer.key [-hash sha256] [-t http://timestamp.digicert.com] app
-authentielf sign -append -hash sha512 -cert other.pem -key other.key app   # add a second signature
+authentielf sign -cert-file signer.pem -key-file signer.key [-hash sha256] [-t http://timestamp.digicert.com] app
+authentielf sign -append -hash sha512 -cert-file other.pem -key-file other.key app   # add a second signature
 authentielf verify [-ca root.pem] [-tsa-ca tsa-root.pem] app              # exit 0 = all signatures valid
 authentielf show app                                                      # inspect without trust checks
 authentielf timestamp -t URL [-index N] app
@@ -86,9 +84,35 @@ authentielf extract [-index N] [-pem] -o sig.p7b app
 authentielf digest [-hash sha256] app
 ```
 
-Files are modified in place unless `-o` is given. `-cert` may contain the
+Files are modified in place unless `-o` is given. `-cert-file` may contain the
 signer certificate followed by intermediates. Keys must be unencrypted PEM
 (PKCS#8, PKCS#1 or SEC1); RSA and ECDSA are supported.
+
+A Google Cloud KMS key works too. Pass its resource name. With a crypto key
+and no version, the enabled version matching the first certificate
+is used, and `-hash` defaults to the key's digest:
+
+```sh
+GOOGLE_OAUTH_ACCESS_TOKEN=$(gcloud auth print-access-token) \
+  authentielf sign -cert-file chain.pem -t http://timestamp.digicert.com \
+  -key-file gcp-kms://projects/P/locations/L/keyRings/R/cryptoKeys/K app
+```
+
+Supported algorithms are `RSA_SIGN_PKCS1_*` and `EC_SIGN_P256_SHA256`/`EC_SIGN_P384_SHA384`.
+
+Without `-key-file` or `-cert-file`, `sign` reads them from the
+environment. This is handy in CI. Set at most one variable per item:
+
+| | file (or URI) | PEM text |
+|---|---|---|
+| key | `SIGN_KEY_FILE` (path or `gcp-kms://…`) | `SIGN_KEY` |
+| certificate chain | `SIGN_CERT_FILE` | `SIGN_CERT` |
+| extra intermediates (optional, `-chain-file`) | `SIGN_CHAIN_FILE` | `SIGN_CHAIN` |
+
+```sh
+SIGN_KEY_FILE=gcp-kms://projects/P/locations/L/keyRings/R/cryptoKeys/K \
+SIGN_CERT="$(cat chain.pem)" GOOGLE_OAUTH_ACCESS_TOKEN=… authentielf sign app
+```
 
 `verify` uses the system roots by default. `-ca` replaces them for
 code-signing chains, and the TSA chain is then checked against the system

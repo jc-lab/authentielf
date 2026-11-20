@@ -17,6 +17,7 @@ jobs:
   release:
     needs: test
     runs-on: ubuntu-24.04
+    environment: signed-release
     permissions:
       contents: write          # create the release and upload assets
       id-token: write          # OIDC token for the Sigstore signing certificate
@@ -24,6 +25,7 @@ jobs:
       artifact-metadata: write # artifact storage records (required by actions/attest)
     env:
       TAG: ${{ github.ref_name }}
+      SIGN_TSA: http://timestamp.digicert.com
     steps:
       - uses: actions/checkout@v7
 
@@ -32,6 +34,25 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.mod
 
+      # jsign signs the Windows binaries (Authenticode) with the same Cloud
+      # KMS key; osslsigncode verifies them.
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install signing tools
+        env:
+          JSIGN_VERSION: '7.6'
+          JSIGN_SHA256: 6cf58aa080e7ff82656f320cff8d4a3bff30408df8766806dcba3740dd839fa5
+        run: |
+          jar=$RUNNER_TEMP/jsign-$JSIGN_VERSION.jar
+          curl -fsSL -o "$jar" "https://github.com/ebourg/jsign/releases/download/$JSIGN_VERSION/jsign-$JSIGN_VERSION.jar"
+          echo "$JSIGN_SHA256  $jar" | sha256sum -c -
+          echo "JSIGN=java -jar $jar" >>"$GITHUB_ENV"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends osslsigncode
+
       - name: Check tag
         run: |
           if [[ ! $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -39,40 +60,102 @@ jobs:
             exit 1
           fi
 
-      - name: Build archives
-        run: make dist VERSION="$TAG"
+      # Workload Identity Federation -> short-lived access token for the
+      # signing service account (needs roles/cloudkms.signerVerifier and
+      # roles/cloudkms.viewer, or cloudkms.cryptoKeyVersions.list, on the key).
+      - name: Authenticate to Google Cloud
+        id: gcp
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_KMS_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_lifetime: 900s
+          create_credentials_file: false
+
+      # Linux binaries are signed with authentielf itself (built from this
+      # commit) and Windows binaries with jsign (Authenticode), both via
+      # Cloud KMS, then archived; see scripts/dist.sh and scripts/sign-pe.sh.
+      - name: Build and sign archives
+        env:
+          # Read directly by "authentielf sign" and scripts/sign-pe.sh.
+          SIGN_KEY_FILE: ${{ secrets.SIGN_KEY_FILE }}
+          SIGN_CERT: ${{ vars.SIGN_CERT }}
+          GOOGLE_OAUTH_ACCESS_TOKEN: ${{ steps.gcp.outputs.access_token }}
+        run: |
+          # dist.sh would silently build unsigned archives without a key.
+          [ -n "$SIGN_KEY_FILE" ] || { echo "::error::secrets.SIGN_KEY_FILE is not set"; exit 1; }
+          [ -n "$SIGN_CERT" ] || { echo "::error::vars.SIGN_CERT is not set"; exit 1; }
+          make dist VERSION="$TAG"
+
+      # Unpack every shipped binary into build/bin/<archive>/ for the
+      # signature checks, the smoke test and the per-binary attestations.
+      - name: Extract binaries
+        run: |
+          mkdir -p build/bin
+          for a in build/dist/*.tar.gz; do tar -C build/bin -xzf "$a"; done
+          for a in build/dist/*.zip; do unzip -q -d build/bin "$a"; done
+
+      # System roots: the EV certificate and the TSA must chain to a publicly
+      # trusted root, as they will for users.
+      - name: Verify signatures
+        run: |
+          host="build/bin/authentielf_${TAG}_linux_amd64/authentielf"
+          elf=(build/bin/authentielf_"${TAG}"_linux_*/authentielf)
+          pe=(build/bin/authentielf_"${TAG}"_windows_*/authentielf.exe)
+          for f in "${elf[@]}"; do
+            echo "::group::$f"; "$host" verify "$f"; echo "::endgroup::"
+          done
+          ca=/etc/ssl/certs/ca-certificates.crt
+          for f in "${pe[@]}"; do
+            echo "::group::$f"; osslsigncode verify -in "$f" -CAfile "$ca" -TSA-CAfile "$ca"; echo "::endgroup::"
+          done
+          echo "verified ${#elf[@]} ELF and ${#pe[@]} PE binaries"
+          [ "${#elf[@]}" -gt 0 ] && [ "${#pe[@]}" -gt 0 ]
 
       # Exercise the exact binary being shipped, not a fresh build.
       - name: Smoke test release binary
         run: |
-          dir=$(mktemp -d)
-          tar -C "$dir" -xzf "build/dist/authentielf_${TAG}_linux_amd64.tar.gz"
-          bin="$dir/authentielf_${TAG}_linux_amd64/authentielf"
+          bin="$PWD/build/bin/authentielf_${TAG}_linux_amd64/authentielf"
           "$bin" version | tee /dev/stderr | grep -qF "authentielf $TAG "
           AUTHENTIELF="$bin" OUT="$PWD/build/e2e-release" STRICT=1 test/e2e.sh native
 
-      # SLSA build provenance for every archive listed in SHA256SUMS, signed
-      # with a Sigstore (public-good instance) certificate bound to this
-      # workflow run. Users verify with:
-      #   gh attestation verify <archive> --repo jc-lab/authentielf
+      # SLSA build provenance, signed with a Sigstore (public-good instance)
+      # certificate bound to this workflow run, for every archive and every
+      # binary inside them, so either can be checked on its own:
+      #   gh attestation verify <archive or binary> --repo jc-lab/authentielf
+      - name: List attestation subjects
+        run: |
+          {
+            cat build/dist/SHA256SUMS
+            (cd build/bin && sha256sum -- */authentielf */authentielf.exe)
+          } >"$RUNNER_TEMP/subjects.txt"
+          cat "$RUNNER_TEMP/subjects.txt"
+
       - name: Attest build provenance
         uses: actions/attest@v4
         with:
-          subject-checksums: build/dist/SHA256SUMS
+          subject-checksums: ${{ runner.temp }}/subjects.txt
 
       - name: Verify attestation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           # Retry briefly: a fresh attestation may take a moment to be served.
-          for i in 1 2 3 4 5; do
-            gh attestation verify "build/dist/authentielf_${TAG}_linux_amd64.tar.gz" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-ref "$GITHUB_REF" && exit 0
-            sleep $((i * 5))
-          done
-          exit 1
+          verify() {
+            for i in 1 2 3 4 5; do
+              gh attestation verify "$1" \
+                --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-ref "$GITHUB_REF" && return 0
+              sleep $((i * 5))
+            done
+            return 1
+          }
+          verify "build/dist/authentielf_${TAG}_linux_amd64.tar.gz"
+          verify "build/bin/authentielf_${TAG}_linux_amd64/authentielf"
+          verify "build/bin/authentielf_${TAG}_windows_amd64/authentielf.exe"
 
       - uses: actions/upload-artifact@v7
         with:
